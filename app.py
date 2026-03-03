@@ -595,7 +595,11 @@ def debug_ytdlp():
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
-    # Test SoundCloud
+    # Test SoundCloud with fresh client_id
+    from chord_analyzer.downloader import _get_soundcloud_client_id
+    sc_client_id = _get_soundcloud_client_id()
+    results["soundcloud_client_id"] = sc_client_id[:8] + "..." if sc_client_id else "not found"
+
     tmpdir = tempfile.mkdtemp()
     try:
         opts = {
@@ -606,6 +610,8 @@ def debug_ytdlp():
             "ffmpeg_location": str(Path(ffmpeg_bin).parent),
             "socket_timeout": 20,
         }
+        if sc_client_id:
+            opts["extractor_args"] = {"soundcloud": {"client_id": [sc_client_id]}}
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.download([f"scsearch1:{query}"])
         import glob

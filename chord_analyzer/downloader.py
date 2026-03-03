@@ -194,11 +194,16 @@ def _download_via_ytdlp(search_query: str, output_path: Path, safe_name: str) ->
 
     # YouTube blocked — try SoundCloud as fallback
     log.info("YouTube blocked, trying SoundCloud...")
+    sc_client_id = _get_soundcloud_client_id()
     for f in output_path.glob(f"{safe_name}.*"):
         f.unlink(missing_ok=True)
 
+    sc_opts = dict(base_opts)
+    if sc_client_id:
+        sc_opts["extractor_args"] = {"soundcloud": {"client_id": [sc_client_id]}}
+
     try:
-        with yt_dlp.YoutubeDL(base_opts) as ydl:
+        with yt_dlp.YoutubeDL(sc_opts) as ydl:
             ydl.download([f"scsearch1:{search_query}"])
         result = _find_audio_file(output_path)
         if result:
@@ -207,6 +212,31 @@ def _download_via_ytdlp(search_query: str, output_path: Path, safe_name: str) ->
     except Exception as e:
         log.debug("yt-dlp SoundCloud failed: %s", str(e)[:200])
 
+    return None
+
+
+def _get_soundcloud_client_id() -> str | None:
+    """Extract a fresh SoundCloud client_id from their JS bundles."""
+    try:
+        resp = requests.get(
+            "https://soundcloud.com",
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=10,
+        )
+        # Find JS bundle URLs
+        js_urls = re.findall(r'https://a-v2\.sndcdn\.com/assets/[^\s"]+\.js', resp.text)
+        for js_url in reversed(js_urls):  # Check last bundles first
+            try:
+                js_resp = requests.get(js_url, timeout=10)
+                m = re.search(r'client_id:"([a-zA-Z0-9]+)"', js_resp.text)
+                if m:
+                    client_id = m.group(1)
+                    log.info("Got SoundCloud client_id: %s", client_id[:8] + "...")
+                    return client_id
+            except Exception:
+                continue
+    except Exception as e:
+        log.debug("Failed to get SoundCloud client_id: %s", str(e)[:200])
     return None
 
 

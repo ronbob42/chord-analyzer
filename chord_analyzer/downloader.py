@@ -127,7 +127,10 @@ def _download_spotify_preview(preview_url: str, output_path: Path, safe_name: st
 def _download_via_ytdlp(search_query: str, output_path: Path, safe_name: str) -> Path | None:
     """Download full song from YouTube via yt-dlp (as Python library).
 
-    Returns the WAV path on success, None on failure.
+    Downloads as MP3 (not WAV) to keep file size small (~5MB vs ~60MB).
+    Librosa can load MP3 directly.
+
+    Returns the audio file path on success, None on failure.
     """
     try:
         import yt_dlp
@@ -141,7 +144,8 @@ def _download_via_ytdlp(search_query: str, output_path: Path, safe_name: str) ->
         "format": "bestaudio/best",
         "postprocessors": [{
             "key": "FFmpegExtractAudio",
-            "preferredcodec": "wav",
+            "preferredcodec": "mp3",
+            "preferredquality": "128",
         }],
         "noplaylist": True,
         "quiet": True,
@@ -158,8 +162,12 @@ def _download_via_ytdlp(search_query: str, output_path: Path, safe_name: str) ->
         log.debug("yt-dlp failed: %s", str(e)[:200])
         return None
 
-    wav_files = list(output_path.glob("*.wav"))
-    return wav_files[0] if wav_files else None
+    # Look for any audio file produced
+    for ext in ("*.mp3", "*.wav", "*.m4a", "*.opus"):
+        files = list(output_path.glob(ext))
+        if files:
+            return files[0]
+    return None
 
 
 def download_track(spotify_url: str, output_dir: str | None = None) -> tuple[Path, dict]:

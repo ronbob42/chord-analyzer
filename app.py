@@ -31,6 +31,13 @@ SESSION_TTL = 1800  # 30 minutes
 ALLOWED_EXTENSIONS = {".mp3", ".wav", ".ogg", ".flac", ".m4a", ".aac", ".wma", ".opus"}
 MAX_UPLOAD_MB = 50
 
+MIME_MAP = {".mp3": "audio/mpeg", ".wav": "audio/wav", ".ogg": "audio/ogg",
+            ".m4a": "audio/mp4", ".flac": "audio/flac", ".opus": "audio/opus"}
+
+
+def _audio_mime(path: str) -> str:
+    return MIME_MAP.get(Path(path).suffix.lower(), "audio/mpeg")
+
 
 def _cleanup_loop():
     """Background thread that removes expired sessions."""
@@ -440,7 +447,7 @@ def _analyze_and_store(audio_path: str, metadata: dict, tmpdir: str) -> dict:
         events,
         metadata,
         audio_src=f"/audio/{session_id}",
-        audio_type="audio/wav",
+        audio_type=_audio_mime(str(audio_path)),
         total_duration=duration,
     )
 
@@ -562,6 +569,36 @@ def _sse_event(step: str, **kwargs) -> str:
     return f"data: {json.dumps(payload)}\n\n"
 
 
+import queue
+
+
+def _sse_stream(worker_fn):
+    """Run worker_fn in a thread; yield SSE events + keepalive pings.
+
+    worker_fn receives a queue and pushes SSE event strings into it.
+    The generator polls the queue, yielding events when available and
+    sending SSE comments (`: keepalive`) every 5 seconds to prevent
+    proxy/browser timeout.
+    """
+    q = queue.Queue()
+    t = threading.Thread(target=worker_fn, args=(q,), daemon=True)
+    t.start()
+
+    while True:
+        try:
+            event = q.get(timeout=5)
+        except queue.Empty:
+            # Send SSE comment as keepalive ping
+            yield ": keepalive\n\n"
+            continue
+
+        if event is None:
+            break  # Worker signals completion
+        yield event
+
+    t.join(timeout=1)
+
+
 @app.route("/api/analyze/stream")
 def api_analyze_stream():
     url = (request.args.get("url") or "").strip()
@@ -570,40 +607,40 @@ def api_analyze_stream():
             yield _sse_event("error", msg="Please enter a valid Spotify track URL.")
         return Response(error_gen(), content_type="text/event-stream")
 
-    def generate():
+    def worker(q):
         tmpdir = tempfile.mkdtemp(prefix="chord_web_")
         try:
-            yield _sse_event("fetching")
+            q.put(_sse_event("fetching"))
 
-            yield _sse_event("downloading")
+            q.put(_sse_event("downloading"))
             audio_path, metadata = download_track(url, tmpdir)
 
-            yield _sse_event("loading")
+            q.put(_sse_event("loading"))
             y, sr = librosa.load(str(audio_path), sr=SAMPLE_RATE)
             if len(y) / sr < 5:
-                yield _sse_event("error", msg="Audio file is too short for chord analysis.")
+                q.put(_sse_event("error", msg="Audio file is too short for chord analysis."))
                 return
 
-            yield _sse_event("extracting")
+            q.put(_sse_event("extracting"))
             chroma = _extract_chroma(y, sr)
 
-            yield _sse_event("matching")
+            q.put(_sse_event("matching"))
             labels, confidences = _match_chords(chroma, CONFIDENCE_THRESHOLD)
             labels, confidences = _stabilize_labels(labels, confidences)
             events = _merge_events(labels, confidences, sr, HOP_LENGTH, MIN_CHORD_DURATION)
 
             if not events:
-                yield _sse_event("error", msg="No chords detected in this track.")
+                q.put(_sse_event("error", msg="No chords detected in this track."))
                 shutil.rmtree(tmpdir, ignore_errors=True)
                 return
 
-            yield _sse_event("building")
+            q.put(_sse_event("building"))
             duration = len(y) / sr
             session_id = uuid.uuid4().hex[:12]
             html = generate_player_html(
                 events, metadata,
                 audio_src=f"/audio/{session_id}",
-                audio_type="audio/wav",
+                audio_type=_audio_mime(str(audio_path)),
                 total_duration=duration,
             )
             with _sessions_lock:
@@ -613,16 +650,18 @@ def api_analyze_stream():
                     "tmpdir": tmpdir,
                     "created_at": time.time(),
                 }
-            yield _sse_event("done", session_id=session_id, is_preview=metadata.get("is_preview", False))
+            q.put(_sse_event("done", session_id=session_id, is_preview=metadata.get("is_preview", False)))
 
         except (ValueError, DownloadError) as e:
             shutil.rmtree(tmpdir, ignore_errors=True)
-            yield _sse_event("error", msg=str(e))
+            q.put(_sse_event("error", msg=str(e)))
         except Exception as e:
             shutil.rmtree(tmpdir, ignore_errors=True)
-            yield _sse_event("error", msg=f"Analysis failed: {e}")
+            q.put(_sse_event("error", msg=f"Analysis failed: {e}"))
+        finally:
+            q.put(None)  # Signal completion
 
-    return Response(generate(), content_type="text/event-stream")
+    return Response(_sse_stream(worker), content_type="text/event-stream")
 
 
 @app.route("/api/upload/stream", methods=["POST"])
@@ -644,21 +683,25 @@ def api_upload_stream():
             yield _sse_event("error", msg=f"Unsupported format ({ext}). Use MP3, WAV, OGG, FLAC, or M4A.")
         return Response(error_gen(), content_type="text/event-stream")
 
-    def generate():
+    # Read file into memory before entering the generator (request context ends)
+    file_bytes = file.read()
+    file_name = file.filename
+
+    def worker(q):
         tmpdir = tempfile.mkdtemp(prefix="chord_upload_")
         try:
-            yield _sse_event("saving")
-            safe_name = re.sub(r'[^\w\s\-.]', '', file.filename).strip()[:100]
+            q.put(_sse_event("saving"))
+            safe_name = re.sub(r'[^\w\s\-.]', '', file_name).strip()[:100]
             saved_path = Path(tmpdir) / safe_name
-            file.save(str(saved_path))
+            saved_path.write_bytes(file_bytes)
 
             if saved_path.stat().st_size > MAX_UPLOAD_MB * 1024 * 1024:
                 shutil.rmtree(tmpdir, ignore_errors=True)
-                yield _sse_event("error", msg=f"File too large (max {MAX_UPLOAD_MB} MB).")
+                q.put(_sse_event("error", msg=f"File too large (max {MAX_UPLOAD_MB} MB)."))
                 return
 
             if ext != ".wav":
-                yield _sse_event("converting")
+                q.put(_sse_event("converting"))
                 wav_path = Path(tmpdir) / (saved_path.stem + ".wav")
                 import subprocess
                 try:
@@ -672,26 +715,26 @@ def api_upload_stream():
             else:
                 audio_path = saved_path
 
-            yield _sse_event("loading")
+            q.put(_sse_event("loading"))
             y, sr = librosa.load(str(audio_path), sr=SAMPLE_RATE)
             if len(y) / sr < 5:
-                yield _sse_event("error", msg="Audio file is too short for chord analysis.")
+                q.put(_sse_event("error", msg="Audio file is too short for chord analysis."))
                 return
 
-            yield _sse_event("extracting")
+            q.put(_sse_event("extracting"))
             chroma = _extract_chroma(y, sr)
 
-            yield _sse_event("matching")
+            q.put(_sse_event("matching"))
             labels, confidences = _match_chords(chroma, CONFIDENCE_THRESHOLD)
             labels, confidences = _stabilize_labels(labels, confidences)
             events = _merge_events(labels, confidences, sr, HOP_LENGTH, MIN_CHORD_DURATION)
 
             if not events:
                 shutil.rmtree(tmpdir, ignore_errors=True)
-                yield _sse_event("error", msg="No chords detected in this track.")
+                q.put(_sse_event("error", msg="No chords detected in this track."))
                 return
 
-            yield _sse_event("building")
+            q.put(_sse_event("building"))
             duration = len(y) / sr
             session_id = uuid.uuid4().hex[:12]
             title = saved_path.stem.replace("_", " ").replace("-", " ")
@@ -699,7 +742,7 @@ def api_upload_stream():
             html = generate_player_html(
                 events, metadata,
                 audio_src=f"/audio/{session_id}",
-                audio_type="audio/wav",
+                audio_type=_audio_mime(str(audio_path)),
                 total_duration=duration,
             )
             with _sessions_lock:
@@ -709,13 +752,15 @@ def api_upload_stream():
                     "tmpdir": tmpdir,
                     "created_at": time.time(),
                 }
-            yield _sse_event("done", session_id=session_id, is_preview=False)
+            q.put(_sse_event("done", session_id=session_id, is_preview=False))
 
         except Exception as e:
             shutil.rmtree(tmpdir, ignore_errors=True)
-            yield _sse_event("error", msg=f"Analysis failed: {e}")
+            q.put(_sse_event("error", msg=f"Analysis failed: {e}"))
+        finally:
+            q.put(None)
 
-    return Response(generate(), content_type="text/event-stream")
+    return Response(_sse_stream(worker), content_type="text/event-stream")
 
 
 @app.route("/play/<session_id>")
@@ -737,6 +782,8 @@ def audio(session_id):
     audio_path = session["audio_path"]
     file_size = os.path.getsize(audio_path)
 
+    mime = _audio_mime(audio_path)
+
     range_header = request.headers.get("Range")
     if range_header:
         m = re.match(r"bytes=(\d+)-(\d*)", range_header)
@@ -750,13 +797,13 @@ def audio(session_id):
                 f.seek(start)
                 data = f.read(length)
 
-            resp = Response(data, 206, mimetype="audio/wav")
+            resp = Response(data, 206, mimetype=mime)
             resp.headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
             resp.headers["Accept-Ranges"] = "bytes"
             resp.headers["Content-Length"] = length
             return resp
 
-    return send_file(audio_path, mimetype="audio/wav")
+    return send_file(audio_path, mimetype=mime)
 
 
 if __name__ == "__main__":

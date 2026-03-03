@@ -1,0 +1,8 @@
+yt-dlp>=2024.0.0
+requests>=2.28.0
+librosa>=0.10.0
+numpy>=1.23.0
+scipy>=1.10.0
+rich>=13.0.0
+flask>=3.0.0
+gunicorn>=21.2.0

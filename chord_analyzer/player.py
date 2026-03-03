@@ -214,6 +214,16 @@ body {{
   font-size: 0.75rem;
   margin-top: 20px;
 }}
+@media (max-width: 600px) {{
+  #current-chord-label {{ font-size: 3.2rem; }}
+  #current-chord-display {{ padding: 20px 0 16px; }}
+  #timeline-container {{ height: 60px; width: 96%; }}
+  #progress-bar-container {{ width: 96%; height: 10px; }}
+  #controls {{ gap: 16px; padding: 20px 0 12px; }}
+  #play-btn {{ padding: 14px 32px; font-size: 1.1rem; }}
+  #hint {{ display: none; }}
+  #header h1 {{ font-size: 1rem; }}
+}}
 </style>
 </head>
 <body>
@@ -243,7 +253,7 @@ body {{
 
 <div id="hint">Space = play/pause &middot; &larr;&rarr; = seek 5s</div>
 
-<audio id="audio" preload="auto">
+<audio id="audio" preload="auto" playsinline>
   <source src="{audio_src}" type="{audio_type}">
 </audio>
 
@@ -353,7 +363,22 @@ body {{
   }});
 
   playBtn.addEventListener('click', function() {{
-    if (audio.paused) {{ audio.play(); }} else {{ audio.pause(); }}
+    if (audio.paused) {{
+      var p = audio.play();
+      if (p && p.catch) {{
+        p.catch(function(err) {{
+          console.warn('Play failed:', err);
+          // Try loading first, then play
+          audio.load();
+          audio.addEventListener('canplay', function onReady() {{
+            audio.removeEventListener('canplay', onReady);
+            audio.play();
+          }});
+        }});
+      }}
+    }} else {{
+      audio.pause();
+    }}
   }});
 
   // Click to seek on timeline
@@ -373,6 +398,31 @@ body {{
   progressContainer.addEventListener('click', function(e) {{
     var rect = progressContainer.getBoundingClientRect();
     var ratio = (e.clientX - rect.left) / rect.width;
+    audio.currentTime = Math.max(0, Math.min(ratio * totalDuration, totalDuration));
+    updateDisplay();
+  }});
+
+  // Touch seek on timeline
+  timelineContainer.addEventListener('touchstart', function(e) {{
+    e.preventDefault();
+    var touch = e.touches[0];
+    var rect = timelineContainer.getBoundingClientRect();
+    var clickX = touch.clientX - rect.left;
+    var currentTransform = parseFloat(
+      (timeline.style.transform || '').replace('translateX(', '').replace('px)', '')
+    ) || 0;
+    var timelineX = clickX - currentTransform;
+    var seekTime = timelineX / PX_PER_SEC;
+    audio.currentTime = Math.max(0, Math.min(seekTime, totalDuration));
+    updateDisplay();
+  }});
+
+  // Touch seek on progress bar
+  progressContainer.addEventListener('touchstart', function(e) {{
+    e.preventDefault();
+    var touch = e.touches[0];
+    var rect = progressContainer.getBoundingClientRect();
+    var ratio = (touch.clientX - rect.left) / rect.width;
     audio.currentTime = Math.max(0, Math.min(ratio * totalDuration, totalDuration));
     updateDisplay();
   }});

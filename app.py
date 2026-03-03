@@ -394,7 +394,7 @@ function submitUploadSSE(formData, btn) {
       reader.read().then(function(result) {
         if (result.done) return;
         buffer += decoder.decode(result.value, {stream: true});
-        var lines = buffer.split('\n');
+        var lines = buffer.split('\\n');
         buffer = lines.pop();
         lines.forEach(function(line) {
           if (line.startsWith('data: ')) {

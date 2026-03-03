@@ -164,33 +164,19 @@ def _download_via_ytdlp(search_query: str, output_path: Path, safe_name: str) ->
         "socket_timeout": 30,
     }
 
-    # Try YouTube with different player clients to bypass bot detection
-    player_clients = [
-        "default",
-        "web_creator",
-        "android_vr",
-        "mediaconnect",
-    ]
-
-    for client in player_clients:
-        # Clean up any partial downloads
+    # Try YouTube (default client only — skip retries if bot-blocked)
+    try:
+        with yt_dlp.YoutubeDL(base_opts) as ydl:
+            ydl.download([f"ytsearch1:{search_query}"])
+        result = _find_audio_file(output_path)
+        if result:
+            log.info("YouTube download succeeded")
+            return result
+    except Exception as e:
+        log.debug("yt-dlp YouTube failed: %s", str(e)[:200])
+        # Clean up partial downloads
         for f in output_path.glob(f"{safe_name}.*"):
             f.unlink(missing_ok=True)
-
-        opts = dict(base_opts)
-        if client != "default":
-            opts["extractor_args"] = {"youtube": {"player_client": [client]}}
-
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                ydl.download([f"ytsearch1:{search_query}"])
-            result = _find_audio_file(output_path)
-            if result:
-                log.info("YouTube download succeeded with client=%s", client)
-                return result
-        except Exception as e:
-            log.debug("yt-dlp YouTube (client=%s) failed: %s", client, str(e)[:200])
-            continue
 
     # YouTube blocked — try SoundCloud as fallback
     log.info("YouTube blocked, trying SoundCloud...")

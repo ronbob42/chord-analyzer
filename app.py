@@ -551,6 +551,65 @@ def api_upload():
         return jsonify(error=f"Analysis failed: {e}"), 500
 
 
+@app.route("/api/debug-ytdlp")
+def debug_ytdlp():
+    """Temporary diagnostic: test yt-dlp on this host."""
+    import subprocess as sp
+    results = {}
+    # Check yt-dlp version
+    try:
+        r = sp.run(["yt-dlp", "--version"], capture_output=True, text=True, timeout=10)
+        results["ytdlp_version"] = r.stdout.strip()
+    except Exception as e:
+        results["ytdlp_version"] = f"error: {e}"
+    # Check ffmpeg
+    try:
+        r = sp.run(["ffmpeg", "-version"], capture_output=True, text=True, timeout=10)
+        results["ffmpeg"] = r.stdout.split("\n")[0]
+    except Exception as e:
+        results["ffmpeg"] = f"error: {e}"
+    # Try a quick YouTube search
+    try:
+        import yt_dlp
+        ydl_opts = {"quiet": True, "no_warnings": True, "skip_download": True, "socket_timeout": 15}
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info("ytsearch1:Metallica Nothing Else Matters", download=False)
+            entries = info.get("entries", [])
+            if entries:
+                e = entries[0]
+                results["search_result"] = {"title": e.get("title"), "duration": e.get("duration"), "id": e.get("id")}
+            else:
+                results["search_result"] = "no results"
+    except Exception as e:
+        results["search_result"] = f"error: {e}"
+    # Try downloading 10 seconds
+    import tempfile
+    tmpdir = tempfile.mkdtemp()
+    try:
+        import yt_dlp
+        from chord_analyzer.downloader import _find_bin
+        ffmpeg_bin = _find_bin("ffmpeg") or "ffmpeg"
+        ydl_opts = {
+            "format": "bestaudio/best",
+            "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "128"}],
+            "noplaylist": True, "quiet": False, "no_warnings": False,
+            "outtmpl": f"{tmpdir}/test.%(ext)s",
+            "ffmpeg_location": str(Path(ffmpeg_bin).parent),
+            "socket_timeout": 15,
+            "download_ranges": lambda info, ydl: [{"start_time": 0, "end_time": 10}],
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download(["ytsearch1:Metallica Nothing Else Matters"])
+        import glob
+        files = glob.glob(f"{tmpdir}/*")
+        results["download"] = [{"file": f, "size": os.path.getsize(f)} for f in files] or "no files"
+    except Exception as e:
+        results["download"] = f"error: {type(e).__name__}: {str(e)[:500]}"
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    return jsonify(results)
+
+
 PROGRESS_MESSAGES = {
     "fetching": "Fetching track info from Spotify...",
     "downloading": "Downloading audio...",

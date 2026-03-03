@@ -200,6 +200,7 @@ def analyze_audio(
     audio_path: str | Path,
     min_duration: float = MIN_CHORD_DURATION,
     confidence_threshold: float = CONFIDENCE_THRESHOLD,
+    progress_cb=None,
 ) -> list[ChordEvent]:
     """Full chord analysis pipeline.
 
@@ -207,15 +208,24 @@ def analyze_audio(
         audio_path: Path to a WAV or MP3 file.
         min_duration: Minimum chord event duration in seconds.
         confidence_threshold: Minimum cosine similarity to accept a chord.
+        progress_cb: Optional callback called with a step name string
+            at each stage ("loading", "extracting", "matching").
 
     Returns:
         List of ChordEvent sorted by start_time.
     """
+    if progress_cb:
+        progress_cb("loading")
     y, sr = librosa.load(str(audio_path), sr=SAMPLE_RATE)
     if len(y) / sr < 5:
         raise ValueError("Audio file is too short for meaningful chord analysis.")
 
+    if progress_cb:
+        progress_cb("extracting")
     chroma = _extract_chroma(y, sr)
+
+    if progress_cb:
+        progress_cb("matching")
     labels, confidences = _match_chords(chroma, confidence_threshold)
     labels, confidences = _stabilize_labels(labels, confidences)
     events = _merge_events(labels, confidences, sr, HOP_LENGTH, min_duration)

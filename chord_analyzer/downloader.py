@@ -124,11 +124,20 @@ def _download_spotify_preview(preview_url: str, output_path: Path, safe_name: st
     return None
 
 
+def _find_audio_file(output_path: Path) -> Path | None:
+    """Find any audio file in the given directory."""
+    for ext in ("*.mp3", "*.wav", "*.m4a", "*.opus", "*.ogg"):
+        files = list(output_path.glob(ext))
+        if files:
+            return files[0]
+    return None
+
+
 def _download_via_ytdlp(search_query: str, output_path: Path, safe_name: str) -> Path | None:
     """Download full song from YouTube via yt-dlp (as Python library).
 
-    Downloads as MP3 (not WAV) to keep file size small (~5MB vs ~60MB).
-    Librosa can load MP3 directly.
+    Tries multiple YouTube player clients to work around bot detection
+    on datacenter IPs. Falls back to SoundCloud if YouTube is blocked.
 
     Returns the audio file path on success, None on failure.
     """
@@ -140,7 +149,7 @@ def _download_via_ytdlp(search_query: str, output_path: Path, safe_name: str) ->
     ffmpeg_bin = _find_bin("ffmpeg") or "ffmpeg"
     output_template = str(output_path / f"{safe_name}.%(ext)s")
 
-    ydl_opts = {
+    base_opts = {
         "format": "bestaudio/best",
         "postprocessors": [{
             "key": "FFmpegExtractAudio",
@@ -155,18 +164,49 @@ def _download_via_ytdlp(search_query: str, output_path: Path, safe_name: str) ->
         "socket_timeout": 30,
     }
 
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([f"ytsearch1:{search_query}"])
-    except Exception as e:
-        log.debug("yt-dlp failed: %s", str(e)[:200])
-        return None
+    # Try YouTube with different player clients to bypass bot detection
+    player_clients = [
+        "default",
+        "web_creator",
+        "android_vr",
+        "mediaconnect",
+    ]
 
-    # Look for any audio file produced
-    for ext in ("*.mp3", "*.wav", "*.m4a", "*.opus"):
-        files = list(output_path.glob(ext))
-        if files:
-            return files[0]
+    for client in player_clients:
+        # Clean up any partial downloads
+        for f in output_path.glob(f"{safe_name}.*"):
+            f.unlink(missing_ok=True)
+
+        opts = dict(base_opts)
+        if client != "default":
+            opts["extractor_args"] = {"youtube": {"player_client": [client]}}
+
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.download([f"ytsearch1:{search_query}"])
+            result = _find_audio_file(output_path)
+            if result:
+                log.info("YouTube download succeeded with client=%s", client)
+                return result
+        except Exception as e:
+            log.debug("yt-dlp YouTube (client=%s) failed: %s", client, str(e)[:200])
+            continue
+
+    # YouTube blocked — try SoundCloud as fallback
+    log.info("YouTube blocked, trying SoundCloud...")
+    for f in output_path.glob(f"{safe_name}.*"):
+        f.unlink(missing_ok=True)
+
+    try:
+        with yt_dlp.YoutubeDL(base_opts) as ydl:
+            ydl.download([f"scsearch1:{search_query}"])
+        result = _find_audio_file(output_path)
+        if result:
+            log.info("SoundCloud download succeeded")
+            return result
+    except Exception as e:
+        log.debug("yt-dlp SoundCloud failed: %s", str(e)[:200])
+
     return None
 
 

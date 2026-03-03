@@ -553,60 +553,72 @@ def api_upload():
 
 @app.route("/api/debug-ytdlp")
 def debug_ytdlp():
-    """Temporary diagnostic: test yt-dlp on this host."""
+    """Temporary diagnostic: test yt-dlp with different clients and SoundCloud."""
     import subprocess as sp
     results = {}
-    # Check yt-dlp version
     try:
         r = sp.run(["yt-dlp", "--version"], capture_output=True, text=True, timeout=10)
         results["ytdlp_version"] = r.stdout.strip()
     except Exception as e:
         results["ytdlp_version"] = f"error: {e}"
-    # Check ffmpeg
-    try:
-        r = sp.run(["ffmpeg", "-version"], capture_output=True, text=True, timeout=10)
-        results["ffmpeg"] = r.stdout.split("\n")[0]
-    except Exception as e:
-        results["ffmpeg"] = f"error: {e}"
-    # Try a quick YouTube search
-    try:
-        import yt_dlp
-        ydl_opts = {"quiet": True, "no_warnings": True, "skip_download": True, "socket_timeout": 15}
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info("ytsearch1:Metallica Nothing Else Matters", download=False)
-            entries = info.get("entries", [])
-            if entries:
-                e = entries[0]
-                results["search_result"] = {"title": e.get("title"), "duration": e.get("duration"), "id": e.get("id")}
+
+    import yt_dlp
+    from chord_analyzer.downloader import _find_bin
+    ffmpeg_bin = _find_bin("ffmpeg") or "ffmpeg"
+    query = "Metallica Nothing Else Matters"
+
+    # Test each YouTube player client
+    clients = ["default", "web_creator", "android_vr", "mediaconnect"]
+    for client in clients:
+        tmpdir = tempfile.mkdtemp()
+        try:
+            opts = {
+                "format": "bestaudio/best",
+                "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "128"}],
+                "noplaylist": True, "quiet": True, "no_warnings": True,
+                "outtmpl": f"{tmpdir}/test.%(ext)s",
+                "ffmpeg_location": str(Path(ffmpeg_bin).parent),
+                "socket_timeout": 20,
+            }
+            if client != "default":
+                opts["extractor_args"] = {"youtube": {"player_client": [client]}}
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.download([f"ytsearch1:{query}"])
+            import glob
+            files = glob.glob(f"{tmpdir}/*")
+            if files:
+                results[f"yt_{client}"] = f"OK - {os.path.getsize(files[0])} bytes"
             else:
-                results["search_result"] = "no results"
-    except Exception as e:
-        results["search_result"] = f"error: {e}"
-    # Try downloading 10 seconds
-    import tempfile
+                results[f"yt_{client}"] = "no files produced"
+        except Exception as e:
+            results[f"yt_{client}"] = f"FAIL: {str(e)[:300]}"
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    # Test SoundCloud
     tmpdir = tempfile.mkdtemp()
     try:
-        import yt_dlp
-        from chord_analyzer.downloader import _find_bin
-        ffmpeg_bin = _find_bin("ffmpeg") or "ffmpeg"
-        ydl_opts = {
+        opts = {
             "format": "bestaudio/best",
             "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "128"}],
-            "noplaylist": True, "quiet": False, "no_warnings": False,
+            "noplaylist": True, "quiet": True, "no_warnings": True,
             "outtmpl": f"{tmpdir}/test.%(ext)s",
             "ffmpeg_location": str(Path(ffmpeg_bin).parent),
-            "socket_timeout": 15,
-            "download_ranges": lambda info, ydl: [{"start_time": 0, "end_time": 10}],
+            "socket_timeout": 20,
         }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download(["ytsearch1:Metallica Nothing Else Matters"])
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download([f"scsearch1:{query}"])
         import glob
         files = glob.glob(f"{tmpdir}/*")
-        results["download"] = [{"file": f, "size": os.path.getsize(f)} for f in files] or "no files"
+        if files:
+            results["soundcloud"] = f"OK - {os.path.getsize(files[0])} bytes"
+        else:
+            results["soundcloud"] = "no files produced"
     except Exception as e:
-        results["download"] = f"error: {type(e).__name__}: {str(e)[:500]}"
+        results["soundcloud"] = f"FAIL: {str(e)[:300]}"
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+
     return jsonify(results)
 
 

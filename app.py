@@ -366,20 +366,35 @@ function submitSpotifySSE(url, btn) {
   status.textContent = 'Starting...';
   spinner.classList.add('active');
 
-  var es = new EventSource('/api/analyze/stream?url=' + encodeURIComponent(url));
-  es.onmessage = function(e) {
-    var data = JSON.parse(e.data);
-    handleSSEMessage(data, btn);
-    if (data.step === 'done' || data.step === 'error') {
+  var finished = false;
+  var retries = 0;
+  var maxRetries = 2;
+
+  function connect() {
+    var es = new EventSource('/api/analyze/stream?url=' + encodeURIComponent(url));
+    es.onmessage = function(e) {
+      var data = JSON.parse(e.data);
+      handleSSEMessage(data, btn);
+      if (data.step === 'done' || data.step === 'error') {
+        finished = true;
+        es.close();
+      }
+    };
+    es.onerror = function() {
       es.close();
-    }
-  };
-  es.onerror = function() {
-    es.close();
-    error.textContent = 'Connection lost. Please try again.';
-    spinner.classList.remove('active');
-    btn.disabled = false;
-  };
+      if (finished) return;
+      retries++;
+      if (retries <= maxRetries) {
+        status.textContent = 'Reconnecting...';
+        setTimeout(connect, 2000);
+      } else {
+        error.textContent = 'Connection lost. Please try again.';
+        spinner.classList.remove('active');
+        btn.disabled = false;
+      }
+    };
+  }
+  connect();
 }
 
 function submitUploadSSE(formData, btn) {
@@ -577,7 +592,7 @@ def _sse_stream(worker_fn):
 
     worker_fn receives a queue and pushes SSE event strings into it.
     The generator polls the queue, yielding events when available and
-    sending SSE comments (`: keepalive`) every 5 seconds to prevent
+    sending SSE comments (`: keepalive`) every 2 seconds to prevent
     proxy/browser timeout.
     """
     q = queue.Queue()
@@ -586,7 +601,7 @@ def _sse_stream(worker_fn):
 
     while True:
         try:
-            event = q.get(timeout=5)
+            event = q.get(timeout=2)
         except queue.Empty:
             # Send SSE comment as keepalive ping
             yield ": keepalive\n\n"
@@ -599,13 +614,22 @@ def _sse_stream(worker_fn):
     t.join(timeout=1)
 
 
+def _sse_response(generator):
+    """Create a streaming SSE Response with anti-buffering headers."""
+    resp = Response(generator, content_type="text/event-stream")
+    resp.headers["Cache-Control"] = "no-cache, no-transform"
+    resp.headers["X-Accel-Buffering"] = "no"
+    resp.headers["Connection"] = "keep-alive"
+    return resp
+
+
 @app.route("/api/analyze/stream")
 def api_analyze_stream():
     url = (request.args.get("url") or "").strip()
     if not url or "spotify.com/track/" not in url:
         def error_gen():
             yield _sse_event("error", msg="Please enter a valid Spotify track URL.")
-        return Response(error_gen(), content_type="text/event-stream")
+        return _sse_response(error_gen())
 
     def worker(q):
         tmpdir = tempfile.mkdtemp(prefix="chord_web_")
@@ -661,7 +685,7 @@ def api_analyze_stream():
         finally:
             q.put(None)  # Signal completion
 
-    return Response(_sse_stream(worker), content_type="text/event-stream")
+    return _sse_response(_sse_stream(worker))
 
 
 @app.route("/api/upload/stream", methods=["POST"])
@@ -669,19 +693,19 @@ def api_upload_stream():
     if "file" not in request.files:
         def error_gen():
             yield _sse_event("error", msg="No file uploaded.")
-        return Response(error_gen(), content_type="text/event-stream")
+        return _sse_response(error_gen())
 
     file = request.files["file"]
     if not file.filename:
         def error_gen():
             yield _sse_event("error", msg="No file selected.")
-        return Response(error_gen(), content_type="text/event-stream")
+        return _sse_response(error_gen())
 
     ext = Path(file.filename).suffix.lower()
     if ext not in ALLOWED_EXTENSIONS:
         def error_gen():
             yield _sse_event("error", msg=f"Unsupported format ({ext}). Use MP3, WAV, OGG, FLAC, or M4A.")
-        return Response(error_gen(), content_type="text/event-stream")
+        return _sse_response(error_gen())
 
     # Read file into memory before entering the generator (request context ends)
     file_bytes = file.read()
@@ -760,7 +784,7 @@ def api_upload_stream():
         finally:
             q.put(None)
 
-    return Response(_sse_stream(worker), content_type="text/event-stream")
+    return _sse_response(_sse_stream(worker))
 
 
 @app.route("/play/<session_id>")

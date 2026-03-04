@@ -1,5 +1,6 @@
 """Flask web app for the Spotify Chord Analyzer."""
 
+import gc
 import json
 import os
 import re
@@ -481,13 +482,16 @@ def _run_analysis(job_id: str, audio_path: str, metadata: dict, tmpdir: str):
     """Run the full analysis pipeline in a background thread."""
     try:
         _set_job_step(job_id, "loading")
-        y, sr = librosa.load(str(audio_path), sr=SAMPLE_RATE)
+        y, sr = librosa.load(str(audio_path), sr=SAMPLE_RATE, duration=180)
         if len(y) / sr < 5:
             _set_job_step(job_id, "error", msg="Audio file is too short for chord analysis.")
             return
 
         _set_job_step(job_id, "extracting")
         chroma = _extract_chroma(y, sr)
+        duration = len(y) / sr  # save before freeing
+        del y                   # free ~8 MB of raw audio
+        gc.collect()
 
         _set_job_step(job_id, "matching")
         labels, confidences = _match_chords(chroma, CONFIDENCE_THRESHOLD)
@@ -500,7 +504,6 @@ def _run_analysis(job_id: str, audio_path: str, metadata: dict, tmpdir: str):
             return
 
         _set_job_step(job_id, "building")
-        duration = len(y) / sr
         session_id = uuid.uuid4().hex[:12]
         html = generate_player_html(
             events, metadata,
@@ -558,7 +561,7 @@ def _upload_worker(job_id: str, file_bytes: bytes, file_name: str, ext: str):
             wav_path = Path(tmpdir) / (saved_path.stem + ".wav")
             try:
                 subprocess.run(
-                    ["ffmpeg", "-i", str(saved_path), "-ar", "22050", "-ac", "1", "-y", str(wav_path)],
+                    ["ffmpeg", "-i", str(saved_path), "-ar", str(SAMPLE_RATE), "-ac", "1", "-y", str(wav_path)],
                     capture_output=True, timeout=120,
                 )
             except (subprocess.TimeoutExpired, FileNotFoundError):

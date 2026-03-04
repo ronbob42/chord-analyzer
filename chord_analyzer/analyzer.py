@@ -10,8 +10,8 @@ from scipy.ndimage import median_filter
 from .templates import generate_all_templates
 
 # Tuning parameters
-SAMPLE_RATE = 22050
-HOP_LENGTH = 2048          # ~93ms per frame
+SAMPLE_RATE = 11025  # low rate saves memory; plenty for chord detection
+HOP_LENGTH = 2048          # ~186ms per frame at 11025 Hz
 HARMONIC_MARGIN = 3.0      # HPSS separation strength
 SMOOTH_KERNEL = 9          # median filter width (frames)
 CONFIDENCE_THRESHOLD = 0.4  # min cosine similarity to accept a chord
@@ -43,6 +43,7 @@ def _extract_chroma(y: np.ndarray, sr: int) -> np.ndarray:
         n_chroma=12,
         bins_per_octave=36,
     )
+    del y_harmonic  # free memory
 
     # Temporal smoothing with median filter
     chroma = median_filter(chroma, size=(1, SMOOTH_KERNEL))

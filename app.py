@@ -4,6 +4,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 import threading
 import time
@@ -14,7 +15,7 @@ import librosa
 from flask import Flask, Response, jsonify, request, send_file
 
 from chord_analyzer.analyzer import (
-    analyze_audio, _extract_chroma, _match_chords, _stabilize_labels,
+    _extract_chroma, _match_chords, _stabilize_labels,
     _merge_events, HOP_LENGTH, CONFIDENCE_THRESHOLD, MIN_CHORD_DURATION,
     SAMPLE_RATE,
 )
@@ -28,22 +29,48 @@ _sessions: dict[str, dict] = {}
 _sessions_lock = threading.Lock()
 SESSION_TTL = 1800  # 30 minutes
 
+# Job storage: job_id -> dict with status info
+_jobs: dict[str, dict] = {}
+_jobs_lock = threading.Lock()
+JOB_TTL = 600  # 10 minutes
+
 ALLOWED_EXTENSIONS = {".mp3", ".wav", ".ogg", ".flac", ".m4a", ".aac", ".wma", ".opus"}
 MAX_UPLOAD_MB = 50
 
 MIME_MAP = {".mp3": "audio/mpeg", ".wav": "audio/wav", ".ogg": "audio/ogg",
             ".m4a": "audio/mp4", ".flac": "audio/flac", ".opus": "audio/opus"}
 
+PROGRESS_MESSAGES = {
+    "fetching": "Fetching track info from Spotify...",
+    "downloading": "Downloading audio...",
+    "saving": "Saving uploaded file...",
+    "converting": "Converting to WAV...",
+    "loading": "Loading audio waveform...",
+    "extracting": "Extracting harmonic content...",
+    "matching": "Matching chord templates...",
+    "building": "Building player...",
+}
+
 
 def _audio_mime(path: str) -> str:
     return MIME_MAP.get(Path(path).suffix.lower(), "audio/mpeg")
 
 
+def _set_job_step(job_id: str, step: str, **kwargs):
+    """Update a job's current step."""
+    with _jobs_lock:
+        if job_id in _jobs:
+            _jobs[job_id]["step"] = step
+            _jobs[job_id]["msg"] = PROGRESS_MESSAGES.get(step, step)
+            _jobs[job_id].update(kwargs)
+
+
 def _cleanup_loop():
-    """Background thread that removes expired sessions."""
+    """Background thread that removes expired sessions and jobs."""
     while True:
         time.sleep(120)
         now = time.time()
+        # Clean sessions
         expired = []
         with _sessions_lock:
             for sid, s in _sessions.items():
@@ -52,6 +79,14 @@ def _cleanup_loop():
             for sid in expired:
                 s = _sessions.pop(sid)
                 shutil.rmtree(s["tmpdir"], ignore_errors=True)
+        # Clean jobs
+        expired_jobs = []
+        with _jobs_lock:
+            for jid, j in _jobs.items():
+                if now - j["created_at"] > JOB_TTL:
+                    expired_jobs.append(jid)
+            for jid in expired_jobs:
+                _jobs.pop(jid)
 
 
 threading.Thread(target=_cleanup_loop, daemon=True).start()
@@ -273,7 +308,7 @@ input[type="file"] { display: none; }
     <div class="status" id="status">Analyzing chords...</div>
   </div>
 
-  <p class="hint">Analysis takes 10-60 seconds depending on song length.</p>
+  <p class="hint">Analysis takes 1-3 minutes depending on song length.</p>
 </div>
 
 <script>
@@ -313,19 +348,79 @@ function selectFile(file) {
   uploadBtn.disabled = false;
 }
 
-// Submit handlers
-uploadBtn.addEventListener('click', function() {
-  if (!selectedFile) return;
-  var formData = new FormData();
-  formData.append('file', selectedFile);
-  submitUploadSSE(formData, uploadBtn);
-});
+// Poll for job status
+function pollJob(jobId, btn) {
+  var spinner = document.getElementById('spinner');
+  var status = document.getElementById('status');
+  var error = document.getElementById('error');
+  var pollErrors = 0;
 
+  var interval = setInterval(function() {
+    fetch('/api/job/' + jobId).then(function(resp) {
+      return resp.json();
+    }).then(function(data) {
+      pollErrors = 0;
+      if (data.step === 'done') {
+        clearInterval(interval);
+        status.textContent = 'Ready!';
+        if (data.is_preview) {
+          document.getElementById('preview-note').style.display = 'block';
+        }
+        window.location.href = '/play/' + data.session_id;
+      } else if (data.step === 'error') {
+        clearInterval(interval);
+        error.textContent = data.msg || 'Something went wrong.';
+        spinner.classList.remove('active');
+        btn.disabled = false;
+      } else {
+        status.textContent = data.msg || data.step;
+      }
+    }).catch(function() {
+      pollErrors++;
+      if (pollErrors > 10) {
+        clearInterval(interval);
+        error.textContent = 'Lost connection to server. Please try again.';
+        spinner.classList.remove('active');
+        btn.disabled = false;
+      }
+    });
+  }, 3000);
+}
+
+// Spotify submit
 document.getElementById('spotify-btn').addEventListener('click', function() {
   var url = document.getElementById('url').value.trim();
   if (!url) return;
   var btn = document.getElementById('spotify-btn');
-  submitSpotifySSE(url, btn);
+  var spinner = document.getElementById('spinner');
+  var status = document.getElementById('status');
+  var error = document.getElementById('error');
+
+  btn.disabled = true;
+  error.textContent = '';
+  status.textContent = 'Starting...';
+  spinner.classList.add('active');
+
+  fetch('/api/analyze/start', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({url: url})
+  }).then(function(resp) {
+    return resp.json();
+  }).then(function(data) {
+    if (data.error) {
+      error.textContent = data.error;
+      spinner.classList.remove('active');
+      btn.disabled = false;
+    } else {
+      status.textContent = 'Downloading audio...';
+      pollJob(data.job_id, btn);
+    }
+  }).catch(function() {
+    error.textContent = 'Network error. Please try again.';
+    spinner.classList.remove('active');
+    btn.disabled = false;
+  });
 });
 
 // Also submit Spotify URL on Enter key
@@ -336,68 +431,10 @@ document.getElementById('url').addEventListener('keydown', function(e) {
   }
 });
 
-function handleSSEMessage(data, btn) {
-  var spinner = document.getElementById('spinner');
-  var status = document.getElementById('status');
-  var error = document.getElementById('error');
-
-  if (data.step === 'done') {
-    if (data.is_preview) {
-      document.getElementById('preview-note').style.display = 'block';
-    }
-    status.textContent = 'Ready!';
-    window.location.href = '/play/' + data.session_id;
-  } else if (data.step === 'error') {
-    error.textContent = data.msg || 'Something went wrong.';
-    spinner.classList.remove('active');
-    btn.disabled = false;
-  } else {
-    status.textContent = data.msg || data.step;
-  }
-}
-
-function submitSpotifySSE(url, btn) {
-  var spinner = document.getElementById('spinner');
-  var status = document.getElementById('status');
-  var error = document.getElementById('error');
-
-  btn.disabled = true;
-  error.textContent = '';
-  status.textContent = 'Starting...';
-  spinner.classList.add('active');
-
-  var finished = false;
-  var retries = 0;
-  var maxRetries = 2;
-
-  function connect() {
-    var es = new EventSource('/api/analyze/stream?url=' + encodeURIComponent(url));
-    es.onmessage = function(e) {
-      var data = JSON.parse(e.data);
-      handleSSEMessage(data, btn);
-      if (data.step === 'done' || data.step === 'error') {
-        finished = true;
-        es.close();
-      }
-    };
-    es.onerror = function() {
-      es.close();
-      if (finished) return;
-      retries++;
-      if (retries <= maxRetries) {
-        status.textContent = 'Reconnecting...';
-        setTimeout(connect, 2000);
-      } else {
-        error.textContent = 'Connection lost. Please try again.';
-        spinner.classList.remove('active');
-        btn.disabled = false;
-      }
-    };
-  }
-  connect();
-}
-
-function submitUploadSSE(formData, btn) {
+// Upload submit
+uploadBtn.addEventListener('click', function() {
+  if (!selectedFile) return;
+  var btn = uploadBtn;
   var spinner = document.getElementById('spinner');
   var status = document.getElementById('status');
   var error = document.getElementById('error');
@@ -407,37 +444,29 @@ function submitUploadSSE(formData, btn) {
   status.textContent = 'Uploading...';
   spinner.classList.add('active');
 
-  fetch('/api/upload/stream', {method: 'POST', body: formData}).then(function(resp) {
-    var reader = resp.body.getReader();
-    var decoder = new TextDecoder();
-    var buffer = '';
+  var formData = new FormData();
+  formData.append('file', selectedFile);
 
-    function read() {
-      reader.read().then(function(result) {
-        if (result.done) return;
-        buffer += decoder.decode(result.value, {stream: true});
-        var lines = buffer.split('\\n');
-        buffer = lines.pop();
-        lines.forEach(function(line) {
-          if (line.startsWith('data: ')) {
-            var data = JSON.parse(line.slice(6));
-            handleSSEMessage(data, btn);
-          }
-        });
-        read();
-      }).catch(function() {
-        error.textContent = 'Connection lost. Please try again.';
-        spinner.classList.remove('active');
-        btn.disabled = false;
-      });
+  fetch('/api/upload/start', {
+    method: 'POST',
+    body: formData
+  }).then(function(resp) {
+    return resp.json();
+  }).then(function(data) {
+    if (data.error) {
+      error.textContent = data.error;
+      spinner.classList.remove('active');
+      btn.disabled = false;
+    } else {
+      status.textContent = 'Processing...';
+      pollJob(data.job_id, btn);
     }
-    read();
   }).catch(function() {
     error.textContent = 'Network error. Please try again.';
     spinner.classList.remove('active');
     btn.disabled = false;
   });
-}
+});
 </script>
 </body>
 </html>
@@ -448,33 +477,103 @@ function submitUploadSSE(formData, btn) {
 # ---------------------------------------------------------------------------
 
 
-def _analyze_and_store(audio_path: str, metadata: dict, tmpdir: str) -> dict:
-    """Shared analysis logic for both upload and Spotify endpoints."""
-    events = analyze_audio(audio_path)
-    if not events:
+def _run_analysis(job_id: str, audio_path: str, metadata: dict, tmpdir: str):
+    """Run the full analysis pipeline in a background thread."""
+    try:
+        _set_job_step(job_id, "loading")
+        y, sr = librosa.load(str(audio_path), sr=SAMPLE_RATE)
+        if len(y) / sr < 5:
+            _set_job_step(job_id, "error", msg="Audio file is too short for chord analysis.")
+            return
+
+        _set_job_step(job_id, "extracting")
+        chroma = _extract_chroma(y, sr)
+
+        _set_job_step(job_id, "matching")
+        labels, confidences = _match_chords(chroma, CONFIDENCE_THRESHOLD)
+        labels, confidences = _stabilize_labels(labels, confidences)
+        events = _merge_events(labels, confidences, sr, HOP_LENGTH, MIN_CHORD_DURATION)
+
+        if not events:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            _set_job_step(job_id, "error", msg="No chords detected in this track.")
+            return
+
+        _set_job_step(job_id, "building")
+        duration = len(y) / sr
+        session_id = uuid.uuid4().hex[:12]
+        html = generate_player_html(
+            events, metadata,
+            audio_src=f"/audio/{session_id}",
+            audio_type=_audio_mime(str(audio_path)),
+            total_duration=duration,
+        )
+        with _sessions_lock:
+            _sessions[session_id] = {
+                "audio_path": str(audio_path),
+                "html": html,
+                "tmpdir": tmpdir,
+                "created_at": time.time(),
+            }
+        _set_job_step(job_id, "done",
+                      session_id=session_id,
+                      is_preview=metadata.get("is_preview", False))
+
+    except Exception as e:
         shutil.rmtree(tmpdir, ignore_errors=True)
-        return {"error": "No chords detected in this track.", "status": 422}
+        _set_job_step(job_id, "error", msg=f"Analysis failed: {e}")
 
-    duration = librosa.get_duration(path=str(audio_path))
-    session_id = uuid.uuid4().hex[:12]
 
-    html = generate_player_html(
-        events,
-        metadata,
-        audio_src=f"/audio/{session_id}",
-        audio_type=_audio_mime(str(audio_path)),
-        total_duration=duration,
-    )
+def _spotify_worker(job_id: str, url: str):
+    """Background worker for Spotify URL analysis."""
+    tmpdir = tempfile.mkdtemp(prefix="chord_web_")
+    try:
+        _set_job_step(job_id, "downloading")
+        audio_path, metadata = download_track(url, tmpdir)
+        _run_analysis(job_id, str(audio_path), metadata, tmpdir)
+    except (ValueError, DownloadError) as e:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        _set_job_step(job_id, "error", msg=str(e))
+    except Exception as e:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        _set_job_step(job_id, "error", msg=f"Download failed: {e}")
 
-    with _sessions_lock:
-        _sessions[session_id] = {
-            "audio_path": str(audio_path),
-            "html": html,
-            "tmpdir": tmpdir,
-            "created_at": time.time(),
-        }
 
-    return {"session_id": session_id, "is_preview": metadata.get("is_preview", False)}
+def _upload_worker(job_id: str, file_bytes: bytes, file_name: str, ext: str):
+    """Background worker for file upload analysis."""
+    tmpdir = tempfile.mkdtemp(prefix="chord_upload_")
+    try:
+        _set_job_step(job_id, "saving")
+        safe_name = re.sub(r'[^\w\s\-.]', '', file_name).strip()[:100]
+        saved_path = Path(tmpdir) / safe_name
+        saved_path.write_bytes(file_bytes)
+
+        if saved_path.stat().st_size > MAX_UPLOAD_MB * 1024 * 1024:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            _set_job_step(job_id, "error", msg=f"File too large (max {MAX_UPLOAD_MB} MB).")
+            return
+
+        if ext != ".wav":
+            _set_job_step(job_id, "converting")
+            wav_path = Path(tmpdir) / (saved_path.stem + ".wav")
+            try:
+                subprocess.run(
+                    ["ffmpeg", "-i", str(saved_path), "-ar", "22050", "-ac", "1", "-y", str(wav_path)],
+                    capture_output=True, timeout=120,
+                )
+            except (subprocess.TimeoutExpired, FileNotFoundError):
+                wav_path = saved_path
+            audio_path = wav_path if (wav_path.exists() and wav_path.stat().st_size > 0) else saved_path
+        else:
+            audio_path = saved_path
+
+        title = saved_path.stem.replace("_", " ").replace("-", " ")
+        metadata = {"artist": "Uploaded", "title": title, "is_preview": False}
+        _run_analysis(job_id, str(audio_path), metadata, tmpdir)
+
+    except Exception as e:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        _set_job_step(job_id, "error", msg=f"Processing failed: {e}")
 
 
 @app.route("/")
@@ -482,33 +581,32 @@ def index():
     return LANDING_HTML
 
 
-@app.route("/api/analyze", methods=["POST"])
-def api_analyze():
+@app.route("/api/analyze/start", methods=["POST"])
+def api_analyze_start():
+    """Start a Spotify analysis job. Returns job_id immediately."""
     body = request.get_json(silent=True) or {}
     url = (body.get("url") or "").strip()
 
     if not url or "spotify.com/track/" not in url:
         return jsonify(error="Please enter a valid Spotify track URL."), 400
 
-    tmpdir = tempfile.mkdtemp(prefix="chord_web_")
+    job_id = uuid.uuid4().hex[:12]
+    with _jobs_lock:
+        _jobs[job_id] = {
+            "step": "fetching",
+            "msg": PROGRESS_MESSAGES["fetching"],
+            "created_at": time.time(),
+        }
 
-    try:
-        audio_path, metadata = download_track(url, tmpdir)
-        result = _analyze_and_store(str(audio_path), metadata, tmpdir)
-        if "error" in result:
-            return jsonify(error=result["error"]), result["status"]
-        return jsonify(result)
+    t = threading.Thread(target=_spotify_worker, args=(job_id, url), daemon=True)
+    t.start()
 
-    except (ValueError, DownloadError) as e:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-        return jsonify(error=str(e)), 400
-    except Exception as e:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-        return jsonify(error=f"Analysis failed: {e}"), 500
+    return jsonify(job_id=job_id)
 
 
-@app.route("/api/upload", methods=["POST"])
-def api_upload():
+@app.route("/api/upload/start", methods=["POST"])
+def api_upload_start():
+    """Start a file upload analysis job. Returns job_id immediately."""
     if "file" not in request.files:
         return jsonify(error="No file uploaded."), 400
 
@@ -520,271 +618,38 @@ def api_upload():
     if ext not in ALLOWED_EXTENSIONS:
         return jsonify(error=f"Unsupported format ({ext}). Use MP3, WAV, OGG, FLAC, or M4A."), 400
 
-    tmpdir = tempfile.mkdtemp(prefix="chord_upload_")
-
-    try:
-        # Save uploaded file
-        safe_name = re.sub(r'[^\w\s\-.]', '', file.filename).strip()[:100]
-        saved_path = Path(tmpdir) / safe_name
-        file.save(str(saved_path))
-
-        if saved_path.stat().st_size > MAX_UPLOAD_MB * 1024 * 1024:
-            shutil.rmtree(tmpdir, ignore_errors=True)
-            return jsonify(error=f"File too large (max {MAX_UPLOAD_MB} MB)."), 400
-
-        # Convert to WAV if needed (librosa handles most formats, but WAV is safest)
-        if ext != ".wav":
-            wav_path = Path(tmpdir) / (saved_path.stem + ".wav")
-            import subprocess
-            try:
-                subprocess.run(
-                    ["ffmpeg", "-i", str(saved_path), "-ar", "22050", "-ac", "1", "-y", str(wav_path)],
-                    capture_output=True, timeout=120,
-                )
-            except (subprocess.TimeoutExpired, FileNotFoundError):
-                # Fall back to letting librosa handle it directly
-                wav_path = saved_path
-
-            if wav_path.exists() and wav_path.stat().st_size > 0:
-                audio_path = wav_path
-            else:
-                audio_path = saved_path
-        else:
-            audio_path = saved_path
-
-        # Extract title from filename
-        title = saved_path.stem.replace("_", " ").replace("-", " ")
-        metadata = {"artist": "Uploaded", "title": title, "is_preview": False}
-
-        result = _analyze_and_store(str(audio_path), metadata, tmpdir)
-        if "error" in result:
-            return jsonify(error=result["error"]), result["status"]
-        return jsonify(result)
-
-    except Exception as e:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-        return jsonify(error=f"Analysis failed: {e}"), 500
-
-
-PROGRESS_MESSAGES = {
-    "fetching": "Fetching track info from Spotify...",
-    "downloading": "Downloading audio...",
-    "saving": "Saving uploaded file...",
-    "converting": "Converting to WAV...",
-    "loading": "Loading audio waveform...",
-    "extracting": "Extracting harmonic content...",
-    "matching": "Matching chord templates...",
-    "building": "Building player...",
-}
-
-
-def _sse_event(step: str, **kwargs) -> str:
-    """Format a server-sent event line."""
-    payload = {"step": step, "msg": PROGRESS_MESSAGES.get(step, step), **kwargs}
-    return f"data: {json.dumps(payload)}\n\n"
-
-
-import queue
-
-
-def _sse_stream(worker_fn):
-    """Run worker_fn in a thread; yield SSE events + keepalive pings.
-
-    worker_fn receives a queue and pushes SSE event strings into it.
-    The generator polls the queue, yielding events when available and
-    sending SSE comments (`: keepalive`) every 2 seconds to prevent
-    proxy/browser timeout.
-    """
-    q = queue.Queue()
-    t = threading.Thread(target=worker_fn, args=(q,), daemon=True)
-    t.start()
-
-    while True:
-        try:
-            event = q.get(timeout=2)
-        except queue.Empty:
-            # Send SSE comment as keepalive ping
-            yield ": keepalive\n\n"
-            continue
-
-        if event is None:
-            break  # Worker signals completion
-        yield event
-
-    t.join(timeout=1)
-
-
-def _sse_response(generator):
-    """Create a streaming SSE Response with anti-buffering headers."""
-    resp = Response(generator, content_type="text/event-stream")
-    resp.headers["Cache-Control"] = "no-cache, no-transform"
-    resp.headers["X-Accel-Buffering"] = "no"
-    resp.headers["Connection"] = "keep-alive"
-    return resp
-
-
-@app.route("/api/analyze/stream")
-def api_analyze_stream():
-    url = (request.args.get("url") or "").strip()
-    if not url or "spotify.com/track/" not in url:
-        def error_gen():
-            yield _sse_event("error", msg="Please enter a valid Spotify track URL.")
-        return _sse_response(error_gen())
-
-    def worker(q):
-        tmpdir = tempfile.mkdtemp(prefix="chord_web_")
-        try:
-            q.put(_sse_event("fetching"))
-
-            q.put(_sse_event("downloading"))
-            audio_path, metadata = download_track(url, tmpdir)
-
-            q.put(_sse_event("loading"))
-            y, sr = librosa.load(str(audio_path), sr=SAMPLE_RATE)
-            if len(y) / sr < 5:
-                q.put(_sse_event("error", msg="Audio file is too short for chord analysis."))
-                return
-
-            q.put(_sse_event("extracting"))
-            chroma = _extract_chroma(y, sr)
-
-            q.put(_sse_event("matching"))
-            labels, confidences = _match_chords(chroma, CONFIDENCE_THRESHOLD)
-            labels, confidences = _stabilize_labels(labels, confidences)
-            events = _merge_events(labels, confidences, sr, HOP_LENGTH, MIN_CHORD_DURATION)
-
-            if not events:
-                q.put(_sse_event("error", msg="No chords detected in this track."))
-                shutil.rmtree(tmpdir, ignore_errors=True)
-                return
-
-            q.put(_sse_event("building"))
-            duration = len(y) / sr
-            session_id = uuid.uuid4().hex[:12]
-            html = generate_player_html(
-                events, metadata,
-                audio_src=f"/audio/{session_id}",
-                audio_type=_audio_mime(str(audio_path)),
-                total_duration=duration,
-            )
-            with _sessions_lock:
-                _sessions[session_id] = {
-                    "audio_path": str(audio_path),
-                    "html": html,
-                    "tmpdir": tmpdir,
-                    "created_at": time.time(),
-                }
-            q.put(_sse_event("done", session_id=session_id, is_preview=metadata.get("is_preview", False)))
-
-        except (ValueError, DownloadError) as e:
-            shutil.rmtree(tmpdir, ignore_errors=True)
-            q.put(_sse_event("error", msg=str(e)))
-        except Exception as e:
-            shutil.rmtree(tmpdir, ignore_errors=True)
-            q.put(_sse_event("error", msg=f"Analysis failed: {e}"))
-        finally:
-            q.put(None)  # Signal completion
-
-    return _sse_response(_sse_stream(worker))
-
-
-@app.route("/api/upload/stream", methods=["POST"])
-def api_upload_stream():
-    if "file" not in request.files:
-        def error_gen():
-            yield _sse_event("error", msg="No file uploaded.")
-        return _sse_response(error_gen())
-
-    file = request.files["file"]
-    if not file.filename:
-        def error_gen():
-            yield _sse_event("error", msg="No file selected.")
-        return _sse_response(error_gen())
-
-    ext = Path(file.filename).suffix.lower()
-    if ext not in ALLOWED_EXTENSIONS:
-        def error_gen():
-            yield _sse_event("error", msg=f"Unsupported format ({ext}). Use MP3, WAV, OGG, FLAC, or M4A.")
-        return _sse_response(error_gen())
-
-    # Read file into memory before entering the generator (request context ends)
+    # Read file into memory before returning (request context ends after response)
     file_bytes = file.read()
     file_name = file.filename
 
-    def worker(q):
-        tmpdir = tempfile.mkdtemp(prefix="chord_upload_")
-        try:
-            q.put(_sse_event("saving"))
-            safe_name = re.sub(r'[^\w\s\-.]', '', file_name).strip()[:100]
-            saved_path = Path(tmpdir) / safe_name
-            saved_path.write_bytes(file_bytes)
+    job_id = uuid.uuid4().hex[:12]
+    with _jobs_lock:
+        _jobs[job_id] = {
+            "step": "saving",
+            "msg": PROGRESS_MESSAGES["saving"],
+            "created_at": time.time(),
+        }
 
-            if saved_path.stat().st_size > MAX_UPLOAD_MB * 1024 * 1024:
-                shutil.rmtree(tmpdir, ignore_errors=True)
-                q.put(_sse_event("error", msg=f"File too large (max {MAX_UPLOAD_MB} MB)."))
-                return
+    t = threading.Thread(target=_upload_worker, args=(job_id, file_bytes, file_name, ext), daemon=True)
+    t.start()
 
-            if ext != ".wav":
-                q.put(_sse_event("converting"))
-                wav_path = Path(tmpdir) / (saved_path.stem + ".wav")
-                import subprocess
-                try:
-                    subprocess.run(
-                        ["ffmpeg", "-i", str(saved_path), "-ar", "22050", "-ac", "1", "-y", str(wav_path)],
-                        capture_output=True, timeout=120,
-                    )
-                except (subprocess.TimeoutExpired, FileNotFoundError):
-                    wav_path = saved_path
-                audio_path = wav_path if (wav_path.exists() and wav_path.stat().st_size > 0) else saved_path
-            else:
-                audio_path = saved_path
+    return jsonify(job_id=job_id)
 
-            q.put(_sse_event("loading"))
-            y, sr = librosa.load(str(audio_path), sr=SAMPLE_RATE)
-            if len(y) / sr < 5:
-                q.put(_sse_event("error", msg="Audio file is too short for chord analysis."))
-                return
 
-            q.put(_sse_event("extracting"))
-            chroma = _extract_chroma(y, sr)
-
-            q.put(_sse_event("matching"))
-            labels, confidences = _match_chords(chroma, CONFIDENCE_THRESHOLD)
-            labels, confidences = _stabilize_labels(labels, confidences)
-            events = _merge_events(labels, confidences, sr, HOP_LENGTH, MIN_CHORD_DURATION)
-
-            if not events:
-                shutil.rmtree(tmpdir, ignore_errors=True)
-                q.put(_sse_event("error", msg="No chords detected in this track."))
-                return
-
-            q.put(_sse_event("building"))
-            duration = len(y) / sr
-            session_id = uuid.uuid4().hex[:12]
-            title = saved_path.stem.replace("_", " ").replace("-", " ")
-            metadata = {"artist": "Uploaded", "title": title, "is_preview": False}
-            html = generate_player_html(
-                events, metadata,
-                audio_src=f"/audio/{session_id}",
-                audio_type=_audio_mime(str(audio_path)),
-                total_duration=duration,
-            )
-            with _sessions_lock:
-                _sessions[session_id] = {
-                    "audio_path": str(audio_path),
-                    "html": html,
-                    "tmpdir": tmpdir,
-                    "created_at": time.time(),
-                }
-            q.put(_sse_event("done", session_id=session_id, is_preview=False))
-
-        except Exception as e:
-            shutil.rmtree(tmpdir, ignore_errors=True)
-            q.put(_sse_event("error", msg=f"Analysis failed: {e}"))
-        finally:
-            q.put(None)
-
-    return _sse_response(_sse_stream(worker))
+@app.route("/api/job/<job_id>")
+def api_job_status(job_id):
+    """Poll for job progress. Returns current step and message."""
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+    if not job:
+        return jsonify(step="error", msg="Job not found or expired."), 404
+    # Return a copy without internal fields
+    return jsonify(
+        step=job["step"],
+        msg=job.get("msg", ""),
+        session_id=job.get("session_id"),
+        is_preview=job.get("is_preview", False),
+    )
 
 
 @app.route("/play/<session_id>")

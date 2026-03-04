@@ -482,7 +482,27 @@ def _run_analysis(job_id: str, audio_path: str, metadata: dict, tmpdir: str):
     """Run the full analysis pipeline in a background thread."""
     try:
         _set_job_step(job_id, "loading")
-        y, sr = librosa.load(str(audio_path), sr=SAMPLE_RATE, duration=180)
+
+        # Pre-convert to low-rate mono WAV with ffmpeg (C-native, low memory)
+        # so librosa never decodes the full-quality audio in Python.
+        analysis_wav = Path(tmpdir) / "_analysis_lr.wav"
+        try:
+            subprocess.run(
+                ["ffmpeg", "-i", str(audio_path),
+                 "-ar", str(SAMPLE_RATE), "-ac", "1", "-t", "120",
+                 "-y", str(analysis_wav)],
+                capture_output=True, timeout=120,
+            )
+            load_path = str(analysis_wav) if (analysis_wav.exists() and analysis_wav.stat().st_size > 0) else str(audio_path)
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            load_path = str(audio_path)
+
+        y, sr = librosa.load(load_path, sr=SAMPLE_RATE, duration=120)
+
+        # Remove temp analysis WAV immediately to free disk
+        if analysis_wav.exists():
+            analysis_wav.unlink(missing_ok=True)
+
         if len(y) / sr < 5:
             _set_job_step(job_id, "error", msg="Audio file is too short for chord analysis.")
             return
@@ -490,7 +510,7 @@ def _run_analysis(job_id: str, audio_path: str, metadata: dict, tmpdir: str):
         _set_job_step(job_id, "extracting")
         chroma = _extract_chroma(y, sr)
         duration = len(y) / sr  # save before freeing
-        del y                   # free ~8 MB of raw audio
+        del y                   # free raw audio
         gc.collect()
 
         _set_job_step(job_id, "matching")

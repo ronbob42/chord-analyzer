@@ -32,8 +32,17 @@ class ChordEvent:
 
 def _extract_chroma(y: np.ndarray, sr: int) -> np.ndarray:
     """Extract smoothed, normalized CQT chromagram from harmonic signal."""
-    # Harmonic-percussive separation — keep only tonal content
-    y_harmonic = librosa.effects.harmonic(y=y, margin=HARMONIC_MARGIN)
+    import gc as _gc
+
+    # Harmonic-percussive separation — manual for memory control
+    # Use smaller n_fft to reduce STFT memory footprint
+    S = librosa.stft(y, n_fft=1024)
+    H, _ = librosa.decompose.hpss(S, margin=HARMONIC_MARGIN)
+    del S, _
+    _gc.collect()
+    y_harmonic = librosa.istft(H, length=len(y))
+    del H
+    _gc.collect()
 
     # CQT chromagram: (12, T)
     chroma = librosa.feature.chroma_cqt(
@@ -43,7 +52,8 @@ def _extract_chroma(y: np.ndarray, sr: int) -> np.ndarray:
         n_chroma=12,
         bins_per_octave=36,
     )
-    del y_harmonic  # free memory
+    del y_harmonic
+    _gc.collect()
 
     # Temporal smoothing with median filter
     chroma = median_filter(chroma, size=(1, SMOOTH_KERNEL))

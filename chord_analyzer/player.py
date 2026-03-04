@@ -292,6 +292,7 @@ body {{
 
   var activeIndex = -1;
   var rafId = null;
+  var fallbackTimer = null;
 
   function formatTime(sec) {{
     var m = Math.floor(sec / 60);
@@ -348,31 +349,56 @@ body {{
     }}
   }}
 
-  audio.addEventListener('play', function() {{
+  function startUpdating() {{
     playBtn.innerHTML = '&#10074;&#10074;  Pause';
-    tick();
-  }});
-  audio.addEventListener('pause', function() {{
-    playBtn.innerHTML = '&#9654;  Play';
+    // Start RAF loop for smooth 60fps updates (desktop)
     if (rafId) cancelAnimationFrame(rafId);
+    tick();
+    // Also start a setInterval fallback for iOS where RAF can stall
+    if (fallbackTimer) clearInterval(fallbackTimer);
+    fallbackTimer = setInterval(function() {{
+      if (audio.paused) {{
+        clearInterval(fallbackTimer);
+        fallbackTimer = null;
+        return;
+      }}
+      updateDisplay();
+    }}, 250);
+  }}
+
+  function stopUpdating() {{
+    playBtn.innerHTML = '&#9654;  Play';
+    if (rafId) {{ cancelAnimationFrame(rafId); rafId = null; }}
+    if (fallbackTimer) {{ clearInterval(fallbackTimer); fallbackTimer = null; }}
+  }}
+
+  audio.addEventListener('play', startUpdating);
+  // timeupdate fires ~4/sec on all platforms including iOS — bulletproof fallback
+  audio.addEventListener('timeupdate', updateDisplay);
+  audio.addEventListener('pause', function() {{
+    stopUpdating();
   }});
   audio.addEventListener('ended', function() {{
-    playBtn.innerHTML = '&#9654;  Play';
-    if (rafId) cancelAnimationFrame(rafId);
+    stopUpdating();
     updateDisplay();
   }});
 
   playBtn.addEventListener('click', function() {{
     if (audio.paused) {{
       var p = audio.play();
-      if (p && p.catch) {{
-        p.catch(function(err) {{
+      if (p && p.then) {{
+        p.then(function() {{
+          // Ensure updates start even if 'play' event was missed
+          startUpdating();
+        }}).catch(function(err) {{
           console.warn('Play failed:', err);
-          // Try loading first, then play
+          // iOS fallback: load then play
           audio.load();
           audio.addEventListener('canplay', function onReady() {{
             audio.removeEventListener('canplay', onReady);
-            audio.play();
+            audio.play().then(function() {{
+              startUpdating();
+            }}).catch(function() {{}});
           }});
         }});
       }}
